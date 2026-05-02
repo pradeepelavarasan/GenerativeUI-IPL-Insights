@@ -4,9 +4,7 @@
 > 
 > ✨ **Exploring MCP Stdio Transports, Prefab UI, and dynamic UI Generation.**
 
-📹 **Demo Video:** [Watch on YouTube](https://youtu.be/wY1bfUxUerI)
-
-
+Demo Video: [Watch on YouTube](https://youtu.be/wY1bfUxUerI)
 ---
 
 ## 📖 "The What" — What is this project?
