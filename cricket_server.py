@@ -8,6 +8,7 @@ import subprocess
 import httpx
 from dotenv import load_dotenv
 import google.generativeai as genai
+from mcp.server.fastmcp import FastMCP
 # from openai import OpenAI
 
 # --- Setup ---
@@ -38,9 +39,12 @@ if GOOGLE_API_KEY:
 
 API_KEY = os.getenv("cricketdata_key")
 
+mcp = FastMCP("CricketInsights")
+
 # =================================================================
 # TOOL 1: INQUIRING ABOUT CRICKET INFORMATION
 # =================================================================
+@mcp.tool()
 def smart_query(user_input: str) -> str:
     logger.info(f"[STEP 1: API] Fetching '{user_input}'")
     try:
@@ -53,7 +57,20 @@ def smart_query(user_input: str) -> str:
             r_s = httpx.get(f"{base_url}/players?apikey={API_KEY}&search={name}", timeout=15.0)
             pid = r_s.json()["data"][0]["id"]
             details = httpx.get(f"{base_url}/players_info?apikey={API_KEY}&id={pid}", timeout=15.0).json()["data"]
-            data = {"type": "PlayerProfile", "name": details.get("name"), "country": details.get("country"), "role": details.get("role"), "stats": details.get("stats", []), "playerImg": details.get("playerImg", "")}
+            
+            stats_list = details.get("stats", [])
+            # Keep payload lightweight (under ~5KB) to prevent LLM timeouts
+            priority_stats = [s for s in stats_list if s.get("matchtype", "") in ["ipl", "t20", "odi"]]
+            truncated_stats = priority_stats[:25] if priority_stats else stats_list[:25]
+            
+            data = {
+                "type": "PlayerProfile", 
+                "name": details.get("name"), 
+                "country": details.get("country"), 
+                "role": details.get("role"), 
+                "stats": truncated_stats, 
+                "playerImg": details.get("playerImg", "")
+            }
         logger.info(f"[STEP 1: API] Status: Success")
         return json.dumps(data)
     except Exception as e:
@@ -63,6 +80,7 @@ def smart_query(user_input: str) -> str:
 # =================================================================
 # TOOL 2: COMMITTING THE HISTORY ENTRY
 # =================================================================
+@mcp.tool()
 def save_history_entry(data_str: str) -> str:
     logger.info("[STEP 3: STORAGE] Committing to history")
     try:
@@ -81,7 +99,8 @@ def save_history_entry(data_str: str) -> str:
 # =================================================================
 # TOOL 3: APP ARCHITECT (WRITES AND RUNS generated_app.py)
 # =================================================================
-def agentic_render(data_str):
+@mcp.tool()
+def agentic_render(data_str: str) -> str:
     logger.info(f"[STEP 2: RENDER] The App Architect is generating the Prefab App...")
     
     prompt = f"""
@@ -150,18 +169,4 @@ def agentic_render(data_str):
 
 # --- Tool Execution Bridge ---
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "run-tool":
-        try:
-            tool_name, args_json = sys.argv[2], sys.argv[3]
-            args_dict = json.loads(args_json)
-            if tool_name == "smart_query":
-                print(smart_query(args_dict.get("user_input", "")))
-            elif tool_name == "render_ui":
-                d_str = args_dict.get("data_str") or args_json
-                print(agentic_render(d_str))
-            elif tool_name == "save_history_entry":
-                d_str = args_dict.get("data_str") or args_json
-                print(save_history_entry(d_str))
-        except Exception as e:
-            sys.stderr.write(f"CRASH: {e}\n")
-        sys.exit(0)
+    mcp.run()
