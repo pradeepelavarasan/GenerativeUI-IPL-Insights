@@ -1,172 +1,302 @@
 import os
+import sys
 import json
 import logging
-import uuid
 import datetime
-import sys
 import subprocess
-import httpx
-from dotenv import load_dotenv
-import google.generativeai as genai
+import requests
+import time
+from google import genai
 from mcp.server.fastmcp import FastMCP
-# from openai import OpenAI
+from dotenv import load_dotenv
 
-# --- Setup ---
+# Load environment variables
 load_dotenv()
+
+# Setup paths and logger
 BASE_DIR = "/Users/pradeep/Library/CloudStorage/OneDrive-Personal/ML/2026 ML Projects/IPL 2026 Insights v2"
-os.makedirs(os.path.join(BASE_DIR, "logs"), exist_ok=True)
+LOG_DIR = os.path.join(BASE_DIR, "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
 
-session_id = "default"
-for i, arg in enumerate(sys.argv):
-    if arg == "--session" and i + 1 < len(sys.argv):
-        session_id = sys.argv[i+1]
-        break
+# Shared memory paths for Zero-Argument architecture (Fixed safeParse bug)
+SHARED_DATA_PATH = os.path.join(BASE_DIR, "latest_data.json")
+SHARED_CODE_PATH = os.path.join(BASE_DIR, "generated_app.py")
 
-log_filename = os.path.join(BASE_DIR, "logs", f"session_{session_id}.log")
 logger = logging.getLogger("IPL_Server_V2")
 logger.setLevel(logging.DEBUG)
-file_handler = logging.FileHandler(log_filename, mode='a')
-file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-logger.addHandler(file_handler)
 
-NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
-MODEL_NAME = os.getenv("MODEL", "gemini-2.5-flash") # Fallback to gemini if not specified
-# nv_client = OpenAI(base_url="https://integrate.api.nvidia.com/v1", api_key=NVIDIA_API_KEY) if NVIDIA_API_KEY else None
+def setup_session_logger():
+    session_id = os.environ.get("SESSION_ID")
+    if not session_id:
+        session_id = f"session_{datetime.datetime.now().strftime('%Y-%m-%dT%H-%M-%S')}"
+    log_file = os.path.join(LOG_DIR, f"{session_id}.log")
+    for handler in logger.handlers[:]:
+        logger.removeHandler(handler)
+    fh = logging.FileHandler(log_file)
+    fh.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    logger.addHandler(fh)
+    return session_id
 
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-if GOOGLE_API_KEY:
-    genai.configure(api_key=GOOGLE_API_KEY)
+# 🆕 Modern GenAI Client (Matches AgenticMCPUse.py standard)
+genai_client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
+MODEL_NAME = os.getenv("MODEL", "gemini-1.5-flash")
 
-API_KEY = os.getenv("cricketdata_key")
+API_RESPONSES_DIR = os.path.join(BASE_DIR, "api_responses")
+os.makedirs(API_RESPONSES_DIR, exist_ok=True)
 
-mcp = FastMCP("CricketInsights")
-
-# =================================================================
-# TOOL 1: INQUIRING ABOUT CRICKET INFORMATION
-# =================================================================
-@mcp.tool()
-def smart_query(user_input: str) -> str:
-    logger.info(f"[STEP 1: API] Fetching '{user_input}'")
-    try:
-        base_url = "https://api.cricapi.com/v1"
-        if any(k in user_input.lower() for k in ["points", "table", "standings"]):
-            r = httpx.get(f"{base_url}/series_points?apikey={API_KEY}&id=87c62aac-bc3c-4738-ab93-19da0690488f", timeout=15.0)
-            data = {"type": "PointsTable", "title": "IPL 2026 Standings", "headers": ["Team", "P", "W", "L", "NRR", "Pts"], "rows": [dict(zip(["team", "p", "w", "l", "nrr", "pts"], [t.get("teamname"), str(t.get("matches")), str(t.get("wins")), str(t.get("loss")), str(t.get("netrr")), str(t.get("pts"))])) for t in r.json().get("data", [])]}
-        else:
-            name = user_input.replace("info", "").strip()
-            r_s = httpx.get(f"{base_url}/players?apikey={API_KEY}&search={name}", timeout=15.0)
-            pid = r_s.json()["data"][0]["id"]
-            details = httpx.get(f"{base_url}/players_info?apikey={API_KEY}&id={pid}", timeout=15.0).json()["data"]
-            
-            stats_list = details.get("stats", [])
-            # Keep payload lightweight (under ~5KB) to prevent LLM timeouts
-            priority_stats = [s for s in stats_list if s.get("matchtype", "") in ["ipl", "t20", "odi"]]
-            truncated_stats = priority_stats[:25] if priority_stats else stats_list[:25]
-            
-            data = {
-                "type": "PlayerProfile", 
-                "name": details.get("name"), 
-                "country": details.get("country"), 
-                "role": details.get("role"), 
-                "stats": truncated_stats, 
-                "playerImg": details.get("playerImg", "")
-            }
-        logger.info(f"[STEP 1: API] Status: Success")
-        return json.dumps(data)
-    except Exception as e:
-        logger.error(f"[STEP 1: API] Status: Failed - {e}")
-        return json.dumps({"error": str(e)})
+# Initialize FastMCP server
+mcp = FastMCP("Cricket Insights V2")
 
 # =================================================================
-# TOOL 2: COMMITTING THE HISTORY ENTRY
+# TOOL 1: FETCH POINTS TABLE
 # =================================================================
 @mcp.tool()
-def save_history_entry(data_str: str) -> str:
-    logger.info("[STEP 3: STORAGE] Committing to history")
+def get_points_table() -> str:
+    """Fetches the current IPL 2026 points table from CricAPI."""
+    setup_session_logger()
+    logger.info("[STEP 1: API] Fetching IPL Points Table")
     try:
-        data = json.loads(data_str)
-        eid = str(uuid.uuid4())
-        h_path = os.path.join(BASE_DIR, "ipl_history_v2.json")
-        history = json.load(open(h_path)) if os.path.exists(h_path) else {}
-        history[eid] = {"id": eid, "data": data, "type": data.get("type"), "timestamp": datetime.datetime.now().isoformat()}
-        json.dump(history, open(h_path, "w"), indent=4)
-        logger.info(f"[STEP 3: STORAGE] Status: Success")
-        return eid
-    except Exception as e:
-        logger.error(f"[STEP 3: STORAGE] Status: Failed - {e}")
-        return "Error"
-
-# =================================================================
-# TOOL 3: APP ARCHITECT (WRITES AND RUNS generated_app.py)
-# =================================================================
-@mcp.tool()
-def agentic_render(data_str: str) -> str:
-    logger.info(f"[STEP 2: RENDER] The App Architect is generating the Prefab App...")
-    
-    prompt = f"""
-    You are the App Architect. Your goal is to write a complete, standalone Python file using the `prefab_ui` library to visualize the provided data.
-    
-    DATA TO RENDER:
-    {data_str}
-    
-    COMPONENTS AVAILABLE (`prefab_ui.components`):
-    - Badge, Button, Card, CardContent, CardHeader, CardTitle
-    - Checkbox, Column, H1, H2, H3, Muted, Progress, Ring, Row
-    - Tab, Tabs, Text
-    
-    RULES:
-    1. Output your code wrapped in a ```python ... ``` markdown block. Do not output raw text without the block.
-    2. Start the file by importing `PrefabApp` and the necessary components from `prefab_ui.components`.
-    3. CRITICAL: You MUST use context managers (`with`) for all nested components. DO NOT use `.add()` or `children=[...]` arrays!
-    4. CRITICAL: DO NOT import or use any chart components (like BarChart, ChartSeries, etc.). They are currently unsupported and will crash the app. Use only basic Layouts and Cards.
-    5. CRITICAL: DO NOT wrap the `with PrefabApp(...)` block inside a `def main():` function. It MUST be at the root module level so the prefab CLI can find it. Do NOT include `if __name__ == '__main__':`.
-       
-       CORRECT EXAMPLE:
-       with PrefabApp(css_class="max-w-5xl mx-auto p-6") as app:
-           with Column(gap=4):
-               with Card():
-                   with CardHeader():
-                       CardTitle('Insights')
-                   with CardContent():
-                       H1('Stats')
-                       Text('Values')
-
-    4. Design a clean, professional dashboard for the provided cricket data using this strict context-manager syntax.
-    """
-    
-    try:
-        model = genai.GenerativeModel(MODEL_NAME)
-        response = model.generate_content(prompt)
-        code = response.text
+        api_key = os.environ.get("cricketdata_key")
+        url = f"https://api.cricapi.com/v1/series_points?apikey={api_key}&id=76f0d2c9-63a2-4a7b-a113-d49d0123"
+        resp = requests.get(url)
+        data = resp.json()
         
-        # Extract only the code inside ```python ... ```
+        # Log to individual file for history
+        filename = f"points_table_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        with open(os.path.join(API_RESPONSES_DIR, filename), "w") as f:
+            json.dump(data, f)
+
+        # Save to Shared Memory for the Zero-Argument bridge
+        with open(SHARED_DATA_PATH, "w") as f:
+            json.dump(data, f)
+            
+        logger.info("[STEP 1: API] Success. Saved to latest_data.json")
+        return "Success"
+    except Exception as e:
+        logger.error(f"[STEP 1: API] Error: {str(e)}")
+        return f"Error: {str(e)}"
+
+# =================================================================
+# TOOL 2: FETCH PLAYER STATISTICS
+# =================================================================
+@mcp.tool()
+def get_player_stats(player_name: str) -> str:
+    """Fetches career statistics for a specific player."""
+    setup_session_logger()
+    logger.info(f"[STEP 1: API] Fetching stats for player: {player_name}")
+    try:
+        api_key = os.environ.get("cricketdata_key")
+        search_url = f"https://api.cricapi.com/v1/players?apikey={api_key}&offset=0&search={player_name}"
+        search_resp = requests.get(search_url).json()
+        
+        if not search_resp.get("data"):
+            return "Error: Player not found"
+            
+        player_id = search_resp["data"][0]["id"]
+        info_url = f"https://api.cricapi.com/v1/players_info?apikey={api_key}&id={player_id}"
+        info_resp = requests.get(info_url).json()
+        
+        # Log to individual file
+        filename = f"player_{player_name.replace(' ', '_')}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        with open(os.path.join(API_RESPONSES_DIR, filename), "w") as f:
+            json.dump(info_resp, f)
+
+        # Save to Shared Memory
+        with open(SHARED_DATA_PATH, "w") as f:
+            json.dump(info_resp, f)
+            
+        logger.info("[STEP 1: API] Success. Saved to latest_data.json")
+        return "Success"
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+# =================================================================
+# TOOL 3: APP ARCHITECT (Zero-Argument Stability)
+# =================================================================
+@mcp.tool()
+def agentic_render() -> str:
+    """Generates a dynamic dashboard using a two-stage Analyst-Architect pattern."""
+    setup_session_logger()
+    start_time = time.perf_counter()
+    logger.info(f"[STEP 2: RENDER] Starting Analyst-Architect process via {MODEL_NAME}...")
+    
+    try:
+        if not os.path.exists(SHARED_DATA_PATH):
+            logger.error("[STEP 2: RENDER] Shared data file not found.")
+            return json.dumps({"status": "error", "message": "No data found"})
+            
+        with open(SHARED_DATA_PATH, "r") as f:
+            data_str = f.read()
+
+        prompt = f"""
+        STAGE 1: ANALYST
+        Analyze this player's JSON data: {data_str}
+        1. Identify the player's primary role (e.g., Opening Batsman, Death Bowler, All-rounder).
+        2. Select exactly the Top 10 most impactful metrics.
+        
+        STAGE 2: ARCHITECT
+        Generate a PURE PREFAB UI dashboard (Python code) for ONLY those 10 metrics.
+        
+        RULES:
+        1. DO NOT use streamlit or st.
+        2. Use ONLY prefab_ui components.
+        3. Imports: 
+           from prefab_ui.app import PrefabApp
+           from prefab_ui.components import (Card, CardHeader, CardContent, CardTitle, CardDescription, H1, H2, H3, Text, Row, Column, Metric, Badge, Separator)
+        
+        4. CONTEXT MANAGER RULES (CRITICAL):
+           - ONLY use 'with' for: Card, CardContent, Row, Column.
+           - NEVER use 'with' for: Metric, Separator, Text, Badge, H1, H2, H3, CardHeader, CardTitle, CardDescription.
+           - Example: 
+             with Row():
+                 Metric(label="X", value="Y") # NO 'with' here!
+             Separator() # NO 'with' here!
+        
+        5. COMPONENT RULES:
+           - Metric MUST use keyword arguments: Metric(label="Name", value="Value").
+           - Every 'with' block MUST contain at least one component.
+        
+        6. DASHBOARD LAYOUT:
+           - Use a main Card as the 'view'.
+           - End with 'app = PrefabApp(view=view)'.
+        """
+        
+        # Using the NEW SDK generation pattern (google-genai v1)
+        response = genai_client.models.generate_content(
+            model=MODEL_NAME,
+            contents=prompt,
+            config={'temperature': 0.1}
+        )
+        
+        code = response.text.strip()
         if "```python" in code:
-            code = code.split("```python")[-1].split("```")[0].strip()
-        elif "```" in code:
-            code = code.split("```")[-1].split("```")[0].strip()
-        
-        # If the LLM completely ignored markdown block rules, aggressively extract from the last import
-        if "from prefab_ui" in code and not code.startswith("from prefab_ui"):
-            code = "from prefab_ui" + code.rsplit("from prefab_ui", 1)[-1]
-        
-        app_path = os.path.join(BASE_DIR, "generated_app.py")
-        with open(app_path, "w", encoding="utf-8") as f:
+            code = code.split("```python")[1].split("```")[0].strip()
+            
+        with open(SHARED_CODE_PATH, "w", encoding="utf-8") as f:
             f.write(code)
             
-        # Kill any existing Prefab server
+        # Spawn Prefab Service
         os.system("pkill -f 'prefab serve'")
+        prefab_bin = os.path.join(BASE_DIR, "venv", "bin", "prefab")
         
-        # Launch the new app in the background using the official prefab CLI
-        subprocess.Popen(["prefab", "serve", "generated_app.py", "--port", "5175"], cwd=BASE_DIR, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # Capture stderr to log startup crashes
+        log_file = os.path.join(BASE_DIR, "logs", "prefab_startup.log")
+        # Suppress auto-open behavior by setting BROWSER=none
+        env = os.environ.copy()
+        env["BROWSER"] = "none"
+        
+        with open(log_file, "w") as f_err:
+            subprocess.Popen([prefab_bin, "serve", "generated_app.py", "--port", "5175"], 
+                             cwd=BASE_DIR, stdout=subprocess.DEVNULL, stderr=f_err, env=env)
             
-        logger.info(f"[STEP 2: RENDER] Status: Success - App generated and running on port 5175")
+        # Poll Port 5175 until ready (max 10s)
+        logger.info("[STEP 2: RENDER] Waiting for Prefab server to bind to port 5175...")
+        import socket
+        success = False
+        for _ in range(20): # 20 * 0.5s = 10s
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                if s.connect_ex(("127.0.0.1", 5175)) == 0:
+                    logger.info("[STEP 2: RENDER] Server ready.")
+                    success = True
+                    break
+            time.sleep(0.5)
         
-        # Return a simple JSON response telling the Next.js frontend to refresh its iframe
-        return json.dumps({"status": "success", "action": "refresh_iframe", "url": "http://127.0.0.1:5175"})
+        if success:
+            logger.info("[STEP 2: RENDER] Dashboard ready for iframe injection.")
+        else:
+            with open(log_file, "r") as f:
+                err_msg = f.read()
+            logger.error(f"[STEP 2: RENDER] Prefab failed to start: {err_msg}")
+            return json.dumps({"status": "error", "message": f"Server crash: {err_msg}"})
+        
+        end_time = time.perf_counter()
+        render_duration = end_time - start_time
+        logger.info(f"[STEP 2: RENDER] Success. Render Time: {render_duration:.2f}s")
+        
+        return json.dumps({
+            "status": "success", 
+            "blueprint": {
+                "action": "refresh_iframe",
+                "url": "http://127.0.0.1:5175"
+            },
+            "render_time": f"{render_duration:.2f}s",
+            "metrics_count": 10
+        })
     except Exception as e:
-        logger.error(f"[STEP 2: RENDER] Status: Failed - {e}")
-        return json.dumps({"error": f"Failed to generate app: {e}"})
+        logger.error(f"[STEP 2: RENDER] Fatal Error: {str(e)}")
+        return json.dumps({"status": "error", "message": str(e)})
 
-# --- Tool Execution Bridge ---
+# =================================================================
+# TOOL 4: SESSION STORAGE
+# =================================================================
+@mcp.tool()
+def save_history_entry() -> str:
+    """Archives the finalized dashboard code to the history folder."""
+    setup_session_logger()
+    logger.info("[STEP 3: STORAGE] Archiving dashboard to history/ folder...")
+    try:
+        if not os.path.exists(SHARED_DATA_PATH) or not os.path.exists(SHARED_CODE_PATH):
+            return json.dumps({"status": "error", "message": "Missing data or code to archive"})
+
+        with open(SHARED_DATA_PATH, "r") as f:
+            data = json.load(f)
+        with open(SHARED_CODE_PATH, "r") as f:
+            code = f.read()
+
+        # Create history directory
+        history_dir = os.path.join(BASE_DIR, "history")
+        os.makedirs(history_dir, exist_ok=True)
+
+        # Generate professional filename: YYYYMMDD_HHMMSS_PlayerName.py
+        # Smart extraction: check 'data' -> 'name' or 'player' -> 'name'
+        player_name = "Unknown_Player"
+        if isinstance(data.get("data"), dict):
+            player_name = data["data"].get("name", "Unknown_Player")
+        elif isinstance(data.get("player"), dict):
+            player_name = data["player"].get("name", "Unknown_Player")
+        
+        player_name = player_name.replace(" ", "_")
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"{timestamp}_{player_name}.py"
+        filepath = os.path.join(history_dir, filename)
+
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(code)
+
+        logger.info(f"[STEP 3: STORAGE] Success. Archived to {filename}")
+        return json.dumps({
+            "status": "success", 
+            "archive_path": filename,
+            "player": player_name
+        })
+    except Exception as e:
+        logger.error(f"[STEP 3: STORAGE] Error: {str(e)}")
+        return json.dumps({"status": "error", "message": str(e)})
+
+# =================================================================
+# TOOL 5: HISTORICAL PLAYBACK
+# =================================================================
+@mcp.tool()
+def render_stored_code(code: str) -> str:
+    """Renders previously generated code from history."""
+    setup_session_logger()
+    logger.info("[PLAYBACK] Rendering stored code")
+    try:
+        with open(SHARED_CODE_PATH, "w", encoding="utf-8") as f:
+            f.write(code)
+        
+        os.system("pkill -f 'prefab serve'")
+        prefab_bin = os.path.join(BASE_DIR, "venv", "bin", "prefab")
+        env = os.environ.copy()
+        env["BROWSER"] = "none"
+        
+        subprocess.Popen([prefab_bin, "serve", "generated_app.py", "--port", "5175"], 
+                         cwd=BASE_DIR, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+        
+        # webbrowser.open("http://127.0.0.1:5175")
+        return json.dumps({"status": "success", "url": "http://127.0.0.1:5175"})
+    except Exception as e:
+        return json.dumps({"status": "error", "message": str(e)})
+
 if __name__ == "__main__":
     mcp.run()

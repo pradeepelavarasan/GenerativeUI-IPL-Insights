@@ -1,105 +1,75 @@
-import { NextResponse } from 'next/server';
+import { NextRequest, NextResponse } from 'next/server';
+import { exec } from 'child_process';
 import path from 'path';
+import { promisify } from 'util';
 import fs from 'fs';
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
-/**
- * Executes a tool via the MCP Stdio Client
- */
-async function runMcpTool(name: string, args: any, sessionId: string): Promise<string> {
-    const venvPath = "/Users/pradeep/Library/CloudStorage/OneDrive-Personal/ML/2026 ML Projects/IPL 2026 Insights v2/venv/bin/python";
-    const scriptPath = path.join(process.cwd(), "..", "cricket_server.py");
+const execPromise = promisify(exec);
 
-    // The Python server might fail to parse --session if FastMCP doesn't allow custom args.
-    // Instead, we will pass it as an environment variable or simply just not pass it since FastMCP handles it.
-    // Actually, our updated cricket_server.py parses sys.argv manually before FastMCP runs, so it's safe.
-    const transport = new StdioClientTransport({
-        command: venvPath,
-        args: [scriptPath, "--session", sessionId],
-        stderr: "pipe"
-    });
-
-    const client = new Client({
-        name: "Nextjs-Cricket-Client",
-        version: "1.0.0"
-    }, { capabilities: {} });
-
-    try {
-        await client.connect(transport);
-        
-        // Call tool
-        const result = await client.callTool({
-            name,
-            arguments: args
-        }, undefined, { timeout: 300000 });
-
-        // FastMCP tools return strings via the content block
-        if (result.content && result.content.length > 0) {
-            const textContent = result.content.find(c => c.type === 'text');
-            if (textContent && textContent.text) {
-                 return textContent.text;
-            }
-        }
-        throw new Error("No text content returned from tool");
-    } finally {
-        try {
-            await client.close();
-        } catch (e) {
-            console.error("Error closing MCP client", e);
-        }
-    }
+function logToSession(sessionId: string, message: string) {
+  const logPath = path.join(process.cwd(), "..", "logs", `${sessionId}.log`);
+  const timestamp = new Date().toISOString().replace('T', ' ').substring(0, 23);
+  const entry = `${timestamp} - INFO - [BRIDGE] ${message}\n`;
+  try {
+    fs.appendFileSync(logPath, entry);
+  } catch (e) {}
+  console.log(`[${sessionId}] ${message}`);
 }
 
-/**
- * Agent Bridge: Handles new queries (POST) and historical rendering (PATCH)
- */
-export async function POST(req: Request) {
+export async function POST(req: NextRequest) {
+  // 1. Generate the Master Session ID in IST (Asia/Kolkata)
+  const now = new Date();
+  const istDate = now.toLocaleDateString('en-GB', { timeZone: 'Asia/Kolkata' }).split('/').reverse().join('-');
+  const istTime = now.toLocaleTimeString('en-US', { timeZone: 'Asia/Kolkata', hour12: true, hour: '2-digit', minute: '2-digit', second: '2-digit' }).replace(/:/g, '-').replace(/ /g, '_');
+  const sessionId = `session_${istDate}_${istTime}`;
+  
   try {
     const { query } = await req.json();
-    const sessionId = new Date().toISOString().replace(/[:.]/g, '-');
-    console.log(`[BRIDGE] Starting Session ${sessionId} for: ${query}`);
+    logToSession(sessionId, `--- 🆕 NEW REQUEST: ${query} ---`);
 
-    // 1. API FETCH
-    const rawData = await runMcpTool("smart_query", { user_input: query }, sessionId);
-    if (rawData.includes('"error":')) {
-        return NextResponse.json({ error: JSON.parse(rawData).error });
+    const pythonPath = path.join(process.cwd(), "..", "venv", "bin", "python3");
+    const orchestratorPath = path.join(process.cwd(), "..", "orchestrator.py");
+
+    // 2. Pass the Master Session ID to Python
+    const command = `"${pythonPath}" "${orchestratorPath}" "${query.replace(/"/g, '\\"')}"`;
+    
+    const { stdout, stderr } = await execPromise(command, {
+      env: { ...process.env, SESSION_ID: sessionId },
+      cwd: path.join(process.cwd(), "..")
+    });
+
+    if (stderr && !stdout) {
+      logToSession(sessionId, `❌ Orchestrator Error: ${stderr}`);
+      throw new Error(stderr);
     }
 
-    // 2. RENDERING (VISUAL FIRST)
-    const blueprintStr = await runMcpTool("agentic_render", { data_str: rawData }, sessionId);
-    const blueprint = JSON.parse(blueprintStr);
+    logToSession(sessionId, `✅ Orchestrator Task Complete.`);
+    const rawOutput = stdout.trim();
+    logToSession(sessionId, `📦 Raw Orchestrator Output Snippet: ${rawOutput.substring(0, 500)}`);
+    
+    // Extract JSON between markers
+    const startMarker = "===RESULT_START===";
+    const endMarker = "===RESULT_END===";
+    const startIndex = rawOutput.indexOf(startMarker);
+    const endIndex = rawOutput.indexOf(endMarker);
 
-    // 3. STORAGE (BACKGROUND)
-    runMcpTool("save_history_entry", { data_str: rawData }, sessionId).catch(e => console.error("History Save Failed", e));
+    if (startIndex !== -1 && endIndex !== -1) {
+      const jsonStr = rawOutput.substring(startIndex + startMarker.length, endIndex).trim();
+      const result = JSON.parse(jsonStr);
+      return NextResponse.json(result);
+    } else {
+      // Fallback for direct JSON output
+      try {
+        const result = JSON.parse(rawOutput);
+        return NextResponse.json(result);
+      } catch (e) {
+        logToSession(sessionId, `❌ JSON Parse Error. Markers not found and raw parse failed.`);
+        throw new Error("Invalid orchestrator response format");
+      }
+    }
 
-    return NextResponse.json({ blueprint });
   } catch (error: any) {
-    console.error('Bridge Error:', error);
+    logToSession(sessionId, `❌ Final Bridge Error: ${error.message}`);
     return NextResponse.json({ error: error.message }, { status: 500 });
   }
-}
-
-export async function PATCH(req: Request) {
-    try {
-        const { entryId } = await req.json();
-        const sessionId = `history-${entryId.slice(0, 8)}`;
-        console.log(`[BRIDGE] Rendering History Entry: ${entryId}`);
-
-        // Load the data from the history file
-        const historyPath = path.join(process.cwd(), "..", "ipl_history_v2.json");
-        const history = JSON.parse(fs.readFileSync(historyPath, 'utf-8'));
-        const entry = history[entryId];
-
-        if (!entry) throw new Error("Entry not found");
-
-        // Render the UI blueprint from the existing data
-        const blueprintStr = await runMcpTool("agentic_render", { data_str: JSON.stringify(entry.data) }, sessionId);
-        const blueprint = JSON.parse(blueprintStr);
-
-        return NextResponse.json({ blueprint });
-    } catch (error: any) {
-        console.error('History Render Error:', error);
-        return NextResponse.json({ error: error.message }, { status: 500 });
-    }
 }

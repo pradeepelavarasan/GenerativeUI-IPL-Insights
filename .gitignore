@@ -12,6 +12,7 @@ node_modules/
 
 # testing
 coverage/
+agentic_tests/
 
 # next.js
 .next/
@@ -52,3 +53,9 @@ ipl_history_v2.json
 prefab_server.log
 generated_app.py
 videos/
+api_responses/
+scratch/
+agentic_tests/
+debugging-instructions.md
+IPL_history_file/
+history/

@@ -29,9 +29,9 @@ Instead of having an LLM return Markdown or raw HTML, we forced the "App Archite
 When querying the live CricAPI for "Virat Kohli", the API returned a massive JSON payload with over 130 nested statistics. Feeding this raw payload into a 26B parameter model (Gemma 4) caused generation latencies exceeding 3.5 minutes, resulting in constant Next.js API timeouts.
 **Learning:** "More context" is not always better for agentic workflows. We solved this by implementing strict payload truncation directly inside the MCP tool—intelligently filtering the API response down to exactly 25 critical stats (~5KB limit). Additionally, we learned to explicitly configure a `300000ms` (5-minute) timeout override on the MCP TypeScript client to handle intensive LLM code-generation steps.
 
-### 4. Component Hallucination & Pydantic Crashes
-Because the generated `prefab_ui` code is executed instantly by the backend, any hallucinated components immediately crashed the server via Pydantic validation errors.
-**Learning:** LLMs will eagerly try to invent "BarChart" or "Graph" components if they see numerical data. We had to explicitly ban these un-implemented schemas in the system prompt, enforcing that the model only construct visual hierarchies using basic Layouts and Text elements.
+### 5. The Integrated Shell & Durable Archival
+Previously, the generated dashboard would pop up in a new, detached browser tab. This created a fragmented user experience.
+**Learning:** We migrated to an **Integrated Shell** model. The backend now returns a `blueprint` JSON payload containing the local URL of the Prefab server. The Next.js frontend dynamically injects this URL into a responsive `<iframe>` directly below the search bar. This keeps the user in a single, focused workspace. Additionally, we implemented a **Durable Archival System** that archives every generated dashboard into a timestamped history folder (`history/YYYYMMDD_HHMMSS_Player.py`), allowing for persistent records of agentic output.
 
 ---
 
@@ -57,18 +57,18 @@ Create a `.env` file in the root directory and add your API keys:
 ```text
 cricketdata_key='your_cricapi_key_here'
 GOOGLE_API_KEY='your_gemini_key_here'
-MODEL='gemma-4-26b-a4b-it'
+MODEL='your model'
 ```
 *(You can get a free Gemini API key at [Google AI Studio](https://aistudio.google.com/))*
 
 ### 4. Launch the Frontend
-Open a second terminal and start the Next.js frontend (the backend is spawned dynamically via the MCP Stdio Client):
+Open a terminal and start the Next.js frontend:
 ```bash
 cd frontend
 npm install
 npm run dev
 ```
-Open your browser to `http://localhost:3000` to watch the MCP execution flow.
+Open your browser to `http://localhost:3000`. When you search for a player, the system will dynamically generate the dashboard and embed it into the page.
 
 ---
 
@@ -85,21 +85,21 @@ Open your browser to `http://localhost:3000` to watch the MCP execution flow.
 ┌─────────────────────────────────────────────────────┐
 │             Python FastMCP Server (Backend)         │
 │                                                     │
-│  1. client.callTool("smart_query")                  │
-│     -> Fetches from CricAPI & truncates payload     │
+│  1. client.callTool("get_player_stats")             │
+│     -> Fetches from CricAPI & saves to JSON         │
 │                                                     │
 │  2. client.callTool("agentic_render")               │
-│     -> Prompts Gemini LLM with PrefabUI rules       │
-│     -> Generates generated_app.py                   │
+│     -> Generates dashboard code via Gemini          │
 │     -> Spawns `prefab serve` background process     │
+│     -> Returns iframe URL blueprint to Frontend     │
 └────────────────────────┬────────────────────────────┘
                          │
                          ▼
 ┌─────────────────────────────────────────────────────┐
-│            Dynamic PrefabUI Application             │
+│            Integrated Shell UI (Next.js)            │
 │                                                     │
-│  ├─ Runs independently on port 5175                 │
-│  └─ Rendered cleanly via <iframe> inside Next.js    │
+│  ├─ Receives blueprint.action: "refresh_iframe"     │
+│  └─ Renders dashboard via <iframe> in-page          │
 └─────────────────────────────────────────────────────┘
 ```
 
