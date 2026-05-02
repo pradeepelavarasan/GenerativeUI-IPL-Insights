@@ -4,11 +4,8 @@
 > 
 > ✨ **Exploring MCP Stdio Transports, Prefab UI, and LLM Code Generation.**
 
-📹 **Demo Video:** *(Link coming soon)*
+📹 **Demo Video:** (https://youtu.be/wY1bfUxUerI)
 
-<p align="center">
-  <img src="https://via.placeholder.com/350x200.png?text=Next.js+Shell" width="350" alt="Next.js Shell Interface" />
-</p>
 
 ---
 
