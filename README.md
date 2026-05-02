@@ -2,9 +2,9 @@
 
 > An educational exploration into the Model Context Protocol (MCP) and Agentic UI generation using Python and Next.js.
 > 
-> ✨ **Exploring MCP Stdio Transports, Prefab UI, and LLM Code Generation.**
+> ✨ **Exploring MCP Stdio Transports, Prefab UI, and dynamic UI Generation.**
 
-📹 **Demo Video:** (https://youtu.be/wY1bfUxUerI)
+📹 **Demo Video:** [Watch on YouTube](https://youtu.be/wY1bfUxUerI)
 
 
 ---
