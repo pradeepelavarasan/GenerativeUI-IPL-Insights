@@ -1,4 +1,4 @@
----
+
 
 > An educational exploration into the Model Context Protocol (MCP) and Agentic UI generation using Python and Next.js.
 > 
